@@ -237,9 +237,9 @@ class StableDiffusionInpaintPipeline(DiffusionPipeline):
                             init_latents_proper = self.scheduler.add_noise(init_latents_orig, noise, t_index_prev + 1)
                         else:
                             init_latents_proper = self.scheduler.add_noise(init_latents_orig, noise, self.scheduler.timesteps[t_index_prev] - 1)
-                        latents = (init_latents_proper * mask) + (latents * (1 - mask))
                     else:
-                        latents = (init_latents_orig * mask) + (latents * (1 - mask))
+                        init_latents_proper = init_latents_orig
+                    latents = (init_latents_proper * (mask ** 0.5)) + (latents * ((1 - mask) ** 0.5))
                     latents_have_orig = True
                 
                 assert isinstance(self.scheduler, LMSDiscreteScheduler), "repaint algorithm is only implemented for LMSDiscreteScheduler for now"
