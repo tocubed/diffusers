@@ -10,7 +10,7 @@ from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 
 from ...models import AutoencoderKL, UNet2DConditionModel
 from ...pipeline_utils import DiffusionPipeline
-from ...schedulers import DDIMScheduler, PNDMScheduler
+from ...schedulers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler
 from . import StableDiffusionPipelineOutput
 from .safety_checker import StableDiffusionSafetyChecker
 
@@ -18,7 +18,7 @@ from .safety_checker import StableDiffusionSafetyChecker
 def preprocess_image(image):
     w, h = image.size
     w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
-    image = image.resize((w, h), resample=PIL.Image.LANCZOS)
+    image = image.resize((w, h), resample=PIL.Image.BICUBIC)
     image = np.array(image).astype(np.float32) / 255.0
     image = image[None].transpose(0, 3, 1, 2)
     image = torch.from_numpy(image)
@@ -29,7 +29,7 @@ def preprocess_mask(mask):
     mask = mask.convert("L")
     w, h = mask.size
     w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
-    mask = mask.resize((w // 8, h // 8), resample=PIL.Image.NEAREST)
+    mask = mask.resize((w // 8, h // 8), resample=PIL.Image.BICUBIC) # blending latents should work
     mask = np.array(mask).astype(np.float32) / 255.0
     mask = np.tile(mask, (4, 1, 1))
     mask = mask[None].transpose(0, 1, 2, 3)  # what does this step do?
@@ -85,6 +85,8 @@ class StableDiffusionInpaintPipeline(DiffusionPipeline):
         generator: Optional[torch.Generator] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
+        repaint_resample_count = 0,
+        repaint_jump_length = 0,
     ):
 
         if isinstance(prompt, str):
@@ -131,8 +133,13 @@ class StableDiffusionInpaintPipeline(DiffusionPipeline):
         # get the original timestep using init_timestep
         init_timestep = int(num_inference_steps * strength) + offset
         init_timestep = min(init_timestep, num_inference_steps)
-        timesteps = self.scheduler.timesteps[-init_timestep]
-        timesteps = torch.tensor([timesteps] * batch_size, dtype=torch.long, device=self.device)
+        if isinstance(self.scheduler, LMSDiscreteScheduler):
+            timesteps = torch.tensor(
+                [num_inference_steps - init_timestep] * batch_size, dtype=torch.long, device=self.device
+            )
+        else:
+            timesteps = self.scheduler.timesteps[-init_timestep]
+            timesteps = torch.tensor([timesteps] * batch_size, dtype=torch.long, device=self.device)
 
         # add noise to latents using the timesteps
         noise = torch.randn(init_latents.shape, generator=generator, device=self.device)
@@ -174,30 +181,82 @@ class StableDiffusionInpaintPipeline(DiffusionPipeline):
         if accepts_eta:
             extra_step_kwargs["eta"] = eta
 
-        latents = init_latents
+        # prepare timestep schedule according to repaint resample and jump size
+        # schedule starts denoising for jump size (or up to remaining) steps, then
+        # renoises back that amount, repeating for repaint_resample_count times, and
+        # denoises further until steps remaining reaches zero
         t_start = max(num_inference_steps - init_timestep + offset, 0)
-        for i, t in tqdm(enumerate(self.scheduler.timesteps[t_start:])):
-            # expand the latents if we are doing classifier free guidance
-            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+        t_indexes = []
+        while True:
+            length = min(len(self.scheduler.timesteps) - t_start, repaint_jump_length)
+            if length <= 0: break
+            t_indexes.extend([t_start + i for i in range(length)])
+            for _ in range(repaint_resample_count):
+                t_indexes.extend([t_start + length - i for i in range(2,length+2)])
+                t_indexes.extend([t_start + i for i in range(length)])
+            t_start += length
 
-            # predict the noise residual
-            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+        latents = init_latents
+        t_index_prev = timesteps[0] if len(timesteps) > 0 else -1
+        latents_have_orig = True
+        for t_index in tqdm(t_indexes):
+            t = self.scheduler.timesteps[t_index]
+            if t_index >= t_index_prev: # forward pass, denoise
+                t = self.scheduler.timesteps[t_index]
 
-            # perform guidance
-            if do_classifier_free_guidance:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
 
-            # compute the previous noisy sample x_t -> x_t-1
-            latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                # if we use LMSDiscreteScheduler, let's make sure latents are mulitplied by sigmas
+                if isinstance(self.scheduler, LMSDiscreteScheduler):
+                    sigma = self.scheduler.sigmas[t_index]
+                    # the model input needs to be scaled to match the continuous ODE formulation in K-LMS
+                    latent_model_input = latent_model_input / ((sigma**2 + 1) ** 0.5)
+                    latent_model_input = latent_model_input.to(self.unet.dtype)
+                    t = t.to(self.unet.dtype)
 
-            # masking
-            init_latents_proper = self.scheduler.add_noise(init_latents_orig, noise, t)
-            latents = (init_latents_proper * mask) + (latents * (1 - mask))
+                # predict the noise residual
+                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+
+                # perform guidance
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                # compute the previous noisy sample x_t -> x_t-1
+                if isinstance(self.scheduler, LMSDiscreteScheduler):
+                    latents = self.scheduler.step(noise_pred, t_index, latents, **extra_step_kwargs)["prev_sample"]
+                else:
+                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)["prev_sample"]
+                latents_have_orig = False
+            else: # backwards pass, renoise
+                if not latents_have_orig: # mask before first renoise after a denoise
+                    if t > 1:
+                        noise = torch.randn(init_latents.shape, generator=generator, device=self.device) # use new noise, seems to work better in searching latent space
+                        if isinstance(self.scheduler, LMSDiscreteScheduler):
+                            init_latents_proper = self.scheduler.add_noise(init_latents_orig, noise, t_index_prev + 1)
+                        else:
+                            init_latents_proper = self.scheduler.add_noise(init_latents_orig, noise, self.scheduler.timesteps[t_index_prev] - 1)
+                        latents = (init_latents_proper * mask) + (latents * (1 - mask))
+                    else:
+                        latents = (init_latents_orig * mask) + (latents * (1 - mask))
+                    latents_have_orig = True
+                
+                assert isinstance(self.scheduler, LMSDiscreteScheduler), "repaint algorithm is only implemented for LMSDiscreteScheduler for now"
+                # this amounts to sub_noise(sample, noise, t_index_prev + 1) followed by the add_noise
+                latents = latents - noise * self.scheduler.sigmas[t_index_prev + 1]
+                latents = self.scheduler.add_noise(latents, noise, t_index_prev)
+                # reset derivatives
+                self.scheduler.derivatives = []
+
+            t_index_prev = t_index
+        
+        if not latents_have_orig:
+            latents = (init_latents_orig * mask) + (latents * (1 - mask))
 
         # scale and decode the image latents with vae
         latents = 1 / 0.18215 * latents
-        image = self.vae.decode(latents).sample
+        image = self.vae.decode(latents.to(self.vae.dtype)).sample
 
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.cpu().permute(0, 2, 3, 1).numpy()
